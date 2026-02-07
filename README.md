@@ -54,7 +54,7 @@ systemctl --user enable --now ydotool
 Run the script to toggle dictation on/off:
 
 ```bash
-bash dictate-toggle.sh
+bash dictate-toggle
 ```
 
 - **First run** starts `whisper-stream` and begins typing transcribed speech at your cursor position.
@@ -67,7 +67,7 @@ Desktop notifications will confirm the current state.
 For hands-free toggling, bind the script to a keyboard shortcut in your desktop environment. For example in Hyprland:
 
 ```
-bind = , F9, exec, bash /path/to/dictate-toggle.sh
+bind = , F9, exec, bash /path/to/dictate-toggle
 ```
 
 ## Configuration
@@ -87,7 +87,7 @@ You can tune these parameters in the script:
 1. `whisper-stream` captures microphone audio and streams transcriptions to stdout
 2. A `while read` loop filters out metadata (timestamps, markers) and extracts the speech text
 3. `ydotool type` simulates keyboard input to type the transcription at your cursor
-4. The process group PID is saved to `/tmp/whisper_vulkan.pid` so a second invocation can cleanly kill everything
+4. The process group PID is saved to `/tmp/whisper_dictate.pid` so a second invocation can cleanly kill everything
 
 ## Issues
 
