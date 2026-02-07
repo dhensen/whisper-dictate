@@ -88,3 +88,11 @@ You can tune these parameters in the script:
 2. A `while read` loop filters out metadata (timestamps, markers) and extracts the speech text
 3. `ydotool type` simulates keyboard input to type the transcription at your cursor
 4. The process group PID is saved to `/tmp/whisper_vulkan.pid` so a second invocation can cleanly kill everything
+
+## Issues
+
+Issues related to third-party dependencies (whisper-stream, ydotool, etc.) should be reported at their respective upstream repositories, not here. This project is only the toggling/typing wrapper around them.
+
+## Contributing
+
+Contributions are welcome! Please open a PR that clearly states what problem is being solved.
