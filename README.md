@@ -25,7 +25,23 @@ These packages conflict with each other — only one can be installed at a time.
 paru -S whisper.cpp-vulkan whisper.cpp-model-large-v3-turbo ydotool libnotify
 ```
 
-Make sure the `ydotoold` daemon is running:
+### Set up ydotool
+
+ydotool needs access to `/dev/uinput`. Create a udev rule:
+
+```bash
+sudo tee /etc/udev/rules.d/80-uinput.rules <<'EOF'
+KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+EOF
+```
+
+Add your user to the `input` group:
+
+```bash
+sudo usermod -aG input $USER
+```
+
+Reboot for the group and udev changes to take effect, then enable the daemon:
 
 ```bash
 systemctl --user enable --now ydotool
