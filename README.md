@@ -2,6 +2,16 @@
 
 Local speech-to-text dictation using [whisper.cpp](https://github.com/ggerganov/whisper.cpp). Toggle it on, speak, and your words get typed wherever your cursor is.
 
+## Install
+
+| Distribution | Package |
+|--------------|---------|
+| Arch Linux (or derivative) | [`whisper-dictate-git`](https://aur.archlinux.org/packages/whisper-dictate-git) (AUR) |
+
+```bash
+paru -S whisper-dictate-git
+```
+
 ## Prerequisites
 
 - **Arch Linux** (or derivative)
