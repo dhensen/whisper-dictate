@@ -1,16 +1,27 @@
-# Whisper Local Speech
+# Whisper Dictate
 
-Local speech-to-text dictation using [whisper.cpp](https://github.com/ggerganov/whisper.cpp) with Vulkan GPU acceleration. Toggle it on, speak, and your words get typed wherever your cursor is.
+Local speech-to-text dictation using [whisper.cpp](https://github.com/ggerganov/whisper.cpp). Toggle it on, speak, and your words get typed wherever your cursor is.
 
 ## Prerequisites
 
-- **Arch Linux** (or derivative) with an AMD GPU supporting Vulkan
+- **Arch Linux** (or derivative)
 - [ydotool](https://github.com/ReimuNotMoe/ydotool) for simulating keyboard input
 - [libnotify](https://gitlab.gnome.org/GNOME/libnotify) for desktop notifications (`notify-send`)
 
-### Install dependencies
+### Install whisper.cpp
+
+Pick **one** of the following `whisper.cpp` packages depending on your hardware:
+
+| Package | GPU | When to use |
+|---------|-----|-------------|
+| `whisper.cpp-vulkan` | AMD/NVIDIA/Intel (Vulkan) | Recommended for most GPU-accelerated setups |
+| `whisper.cpp-hip` | AMD (ROCm) | If you already have a ROCm stack configured |
+| `whisper.cpp` | None (CPU only) | No compatible GPU, or just want simplicity |
+
+These packages conflict with each other — only one can be installed at a time.
 
 ```bash
+# Example: Vulkan (most common)
 paru -S whisper.cpp-vulkan whisper.cpp-model-large-v3-turbo ydotool libnotify
 ```
 
@@ -20,12 +31,14 @@ Make sure the `ydotoold` daemon is running:
 systemctl --user enable --now ydotool
 ```
 
+> **Note:** If using the CPU-only build, remove `--flash-attn` from the script as it requires GPU support.
+
 ## Usage
 
 Run the script to toggle dictation on/off:
 
 ```bash
-bash whisper-vulkan-toggle.sh
+bash dictate-toggle.sh
 ```
 
 - **First run** starts `whisper-stream` and begins typing transcribed speech at your cursor position.
@@ -38,20 +51,20 @@ Desktop notifications will confirm the current state.
 For hands-free toggling, bind the script to a keyboard shortcut in your desktop environment. For example in Hyprland:
 
 ```
-bind = , F9, exec, bash /path/to/whisper-vulkan-toggle.sh
+bind = , F9, exec, bash /path/to/dictate-toggle.sh
 ```
 
 ## Configuration
 
 You can tune these parameters in the script:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `-t` | `8` | CPU threads used alongside the GPU |
-| `--step` | `0` | Audio step size in ms (0 = as fast as possible) |
-| `--length` | `5000` | Audio chunk length in ms |
-| `--flash-attn` | enabled | Flash attention for faster Vulkan inference |
-| `-m` | `large-v3-turbo` | Whisper model path |
+| Parameter      | Default          | Description                                     |
+| -------------- | ---------------- | ----------------------------------------------- |
+| `-t`           | `8`              | CPU threads used alongside the GPU              |
+| `--step`       | `0`              | Audio step size in ms (0 = as fast as possible) |
+| `--length`     | `5000`           | Audio chunk length in ms                        |
+| `--flash-attn` | enabled          | Flash attention for faster GPU inference        |
+| `-m`           | `large-v3-turbo` | Whisper model path                              |
 
 ## How it works
 
