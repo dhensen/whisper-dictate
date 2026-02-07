@@ -13,17 +13,22 @@ else
     # --flash-attn: Speeds up AMD/Vulkan inference
     # -t 4: Uses 4 CPU threads alongside the GPU
     # --step 0: Processes audio as fast as possible
-    setsid whisper-stream \
+    whisper-stream \
         -m "$MODEL" \
         -t 8 --step 0 --length 5000 \
         --flash-attn \
         2>/dev/null | while read -r line; do
-            # Only type if line is NOT empty and NOT a hallucination
-            if [[ -n "$line" ]]; then
-                # Clean leading/trailing whitespace and type
-                CLEAN_LINE=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                ydotool type "$CLEAN_LINE "
+            # Skip metadata lines (### markers, timing info, empty)
+            [[ -z "$line" ]] && continue
+            [[ "$line" == *"### Transcription"* ]] && continue
+            [[ "$line" == *"| t0 ="* ]] && continue
+            [[ "$line" == *"[Start speaking]"* ]] && continue
+            # Extract text after timestamp bracket, or use line as-is
+            if [[ "$line" =~ \[.*--\>.*\](.*) ]]; then
+                line="${BASH_REMATCH[1]}"
             fi
+            CLEAN_LINE=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [[ -n "$CLEAN_LINE" ]] && ydotool type "$CLEAN_LINE "
         done &
 
     echo $! > "$PID_FILE"
