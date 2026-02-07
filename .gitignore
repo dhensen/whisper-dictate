@@ -1,4 +1,5 @@
-pkg
-src
-whisper-dictate-git
+pkg/
+src/
+whisper-dictate-git/
+*.pkg.tar.zst
 
