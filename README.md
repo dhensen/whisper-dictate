@@ -74,11 +74,20 @@ Desktop notifications will confirm the current state.
 
 ### Bind to a hotkey
 
-For hands-free toggling, bind the script to a keyboard shortcut in your desktop environment. For example in Hyprland:
+For hands-free toggling, bind the script to a keyboard shortcut in your desktop environment.
+
+**Hyprland:**
 
 ```
 bind = , F9, exec, whisper-dictate-toggle
 ```
+
+**KDE Plasma:**
+
+1. Open System Settings > Keyboard > Shortcuts
+2. Click **+ Add New** > **Command or Script**
+3. Set the command to `/usr/bin/whisper-dictate-toggle`
+4. Assign your preferred shortcut (e.g. Meta+S)
 
 ## Configuration
 
