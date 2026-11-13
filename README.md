@@ -71,6 +71,18 @@ whisper-dictate-toggle
 
 Desktop notifications will confirm the current state.
 
+### Recording indicator
+
+While recording, a small bar appears at the bottom of the screen with a pulsing red dot, the elapsed time and a live frequency spectrum of your microphone, so you can see that dictation is on and your voice is being picked up. The dot turns grey if no audio arrives, and the bar shows "Transcribing…" after you stop.
+
+The indicator uses the layer-shell protocol (KDE Plasma, Hyprland, Sway, ...) so it never takes keyboard focus away from the window you're dictating into. It needs these optional packages:
+
+```bash
+sudo pacman -S python-gobject gtk4 gtk4-layer-shell
+```
+
+Without them, or on a desktop without layer-shell support (e.g. GNOME), dictation works the same with only the notifications.
+
 ### Bind to a hotkey
 
 For hands-free toggling, bind the script to a keyboard shortcut in your desktop environment.

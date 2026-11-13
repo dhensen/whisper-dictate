@@ -33,6 +33,11 @@ SERVER_URL="http://127.0.0.1:$PORT"
 # background processes (even with setsid) don't reliably survive.
 REC_UNIT="whisper-dictate-rec"
 SERVER_UNIT="whisper-dictate-server"
+OVERLAY_UNIT="whisper-dictate-overlay"
+
+# Recording indicator with live spectrum; prefer the copy next to this script.
+OVERLAY_BIN="$(dirname "$(readlink -f "$0")")/whisper-dictate-overlay"
+[[ -x "$OVERLAY_BIN" ]] || OVERLAY_BIN=$(command -v whisper-dictate-overlay)
 
 mkdir -p "$STATE_DIR"
 
@@ -53,10 +58,22 @@ stop_units() {
     systemctl --user reset-failed "$@" 2>/dev/null
 }
 
+start_overlay() {
+    [[ -n "$OVERLAY_BIN" ]] || return 0
+    # Pass the display connection explicitly; the systemd user manager may
+    # not have it in its environment.
+    local env_args=() var
+    for var in WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP; do
+        [[ -n "${!var}" ]] && env_args+=(-E "$var=${!var}")
+    done
+    systemd-run --user --quiet --collect --unit="$OVERLAY_UNIT" \
+        "${env_args[@]}" "$OVERLAY_BIN" "$1"
+}
+
 start_recording() {
     local wav
     # Clear leftovers from a crashed/killed previous run.
-    stop_units "$REC_UNIT" "$SERVER_UNIT"
+    stop_units "$REC_UNIT" "$SERVER_UNIT" "$OVERLAY_UNIT"
     [[ -f "$WAV_FILE" ]] && rm -f "$(cat "$WAV_FILE")"
 
     wav=$(mktemp "$STATE_DIR/rec-XXXXXX.wav")
@@ -64,6 +81,8 @@ start_recording() {
 
     systemd-run --user --quiet --collect --unit="$REC_UNIT" \
         pw-record --rate 16000 --channels 1 --format s16 "$wav"
+
+    start_overlay "$wav"
 
     local vad_args=()
     [[ -f "$VAD_MODEL" ]] && vad_args=(--vad -vm "$VAD_MODEL")
@@ -84,6 +103,8 @@ stop_and_transcribe() {
     # Stopping the unit sends SIGTERM, which makes pw-record finalize the WAV
     # header; systemctl waits until it has exited.
     stop_units "$REC_UNIT"
+    # Switch the overlay to its "Transcribing…" state.
+    systemctl --user kill -s USR1 "$OVERLAY_UNIT" 2>/dev/null
 
     if [[ -z "$wav" || ! -s "$wav" ]]; then
         notify "No audio recorded" dialog-error
@@ -146,6 +167,7 @@ fi
 
 if unit_active "$REC_UNIT"; then
     stop_and_transcribe
+    stop_units "$OVERLAY_UNIT"
 else
     start_recording
 fi

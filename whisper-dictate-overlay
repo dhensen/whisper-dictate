@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Recording indicator for whisper-dictate.
+
+Shows a small always-on-top bar at the bottom of the screen with a live
+frequency spectrum of the microphone, so you can see that recording is on and
+that your voice is being picked up.
+
+The audio is read from the WAV file that pw-record is writing, so the bars show
+exactly what will be transcribed. Uses the wlr layer-shell protocol (supported
+by KDE Plasma, Hyprland, Sway, ...) so the bar never takes keyboard focus away
+from the window you are dictating into. Without layer-shell support it exits
+quietly rather than open a normal window that would steal focus.
+
+Usage: whisper-dictate-overlay RECORDING.wav
+Send SIGUSR1 to switch the bar to "Transcribing…".
+"""
+
+import cmath
+import ctypes.util
+import math
+import os
+import signal
+import sys
+import time
+from array import array
+
+# gtk4-layer-shell must be loaded before libwayland-client, which for Python
+# means preloading it. Re-exec ourselves with LD_PRELOAD set if needed.
+_LAYER_SHELL_LIB = "libgtk4-layer-shell.so"
+if _LAYER_SHELL_LIB not in os.environ.get("LD_PRELOAD", ""):
+    found = ctypes.util.find_library("gtk4-layer-shell")
+    if found:
+        os.environ["LD_PRELOAD"] = " ".join(
+            filter(None, [found, os.environ.get("LD_PRELOAD")]))
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+
+try:
+    from gi.repository import GLibUnix  # noqa: E402
+    _signal_add = GLibUnix.signal_add
+except ImportError:  # older PyGObject
+    _signal_add = GLib.unix_signal_add
+from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+
+SAMPLE_RATE = 16000
+WAV_HEADER = 44
+FFT_SIZE = 512
+N_BANDS = 28
+F_MIN, F_MAX = 90.0, 7000.0
+DB_FLOOR, DB_CEIL = -72.0, -28.0   # dBFS range mapped to bar height 0..1
+FPS = 30
+
+WIDTH, HEIGHT = 300, 56
+
+CSS = b"""
+window { background: transparent; }
+.panel {
+    background: rgba(24, 24, 27, 0.88);
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+"""
+
+
+# --- spectrum analysis -----------------------------------------------------
+
+def _bit_reverse_table(n):
+    bits = n.bit_length() - 1
+    return [int(f"{i:0{bits}b}"[::-1], 2) for i in range(n)]
+
+
+_REV = _bit_reverse_table(FFT_SIZE)
+_TWIDDLE = [cmath.exp(-2j * math.pi * k / FFT_SIZE) for k in range(FFT_SIZE // 2)]
+_WINDOW = [0.5 - 0.5 * math.cos(2 * math.pi * i / (FFT_SIZE - 1)) for i in range(FFT_SIZE)]
+# Full-scale sine through a Hann window peaks at amplitude * N / 4.
+_REF_POWER = (32768.0 * FFT_SIZE / 4) ** 2
+
+
+def fft(samples):
+    """Iterative radix-2 FFT of a real sequence of length FFT_SIZE."""
+    a = [complex(samples[_REV[i]] * _WINDOW[_REV[i]]) for i in range(FFT_SIZE)]
+    size = 2
+    while size <= FFT_SIZE:
+        half, step = size // 2, FFT_SIZE // size
+        for start in range(0, FFT_SIZE, size):
+            for k in range(half):
+                t = _TWIDDLE[k * step] * a[start + k + half]
+                u = a[start + k]
+                a[start + k] = u + t
+                a[start + k + half] = u - t
+        size *= 2
+    return a
+
+
+def _band_bins():
+    """Log-spaced frequency bands as (first_bin, last_bin) pairs."""
+    hz_per_bin = SAMPLE_RATE / FFT_SIZE
+    edges = [F_MIN * (F_MAX / F_MIN) ** (i / N_BANDS) for i in range(N_BANDS + 1)]
+    bands = []
+    for lo, hi in zip(edges, edges[1:]):
+        b0 = max(1, int(lo / hz_per_bin))
+        b1 = max(b0, int(hi / hz_per_bin))
+        bands.append((b0, b1))
+    return bands
+
+
+_BANDS = _band_bins()
+
+
+def spectrum(samples):
+    """Return N_BANDS levels in 0..1."""
+    spec = fft(samples)
+    levels = []
+    for b0, b1 in _BANDS:
+        power = sum(abs(spec[b]) ** 2 for b in range(b0, b1 + 1)) / (b1 - b0 + 1)
+        db = 10 * math.log10(power / _REF_POWER + 1e-12)
+        levels.append(min(1.0, max(0.0, (db - DB_FLOOR) / (DB_CEIL - DB_FLOOR))))
+    return levels
+
+
+# --- live audio from the growing WAV file ----------------------------------
+
+class WavTail:
+    def __init__(self, path):
+        self.path = path
+        self.f = None
+        self.samples = array("h", [0] * FFT_SIZE)
+        self.leftover = b""
+
+    def read(self):
+        """Read newly written audio; return True if any arrived."""
+        if self.f is None:
+            try:
+                self.f = open(self.path, "rb")
+            except OSError:
+                return False
+            # Start at the end (skip header and anything already recorded).
+            self.f.seek(max(WAV_HEADER, os.fstat(self.f.fileno()).st_size & ~1))
+        data = self.leftover + self.f.read()
+        if len(data) % 2:
+            data, self.leftover = data[:-1], data[-1:]
+        else:
+            self.leftover = b""
+        if not data:
+            return False
+        new = array("h")
+        new.frombytes(data[-FFT_SIZE * 2:])
+        if sys.byteorder != "little":
+            new.byteswap()
+        self.samples = (self.samples + new)[-FFT_SIZE:]
+        return True
+
+
+# --- UI ----------------------------------------------------------------------
+
+class Overlay(Gtk.Application):
+    def __init__(self, wav_path):
+        super().__init__(application_id=None)
+        self.tail = WavTail(wav_path)
+        self.levels = [0.0] * N_BANDS
+        self.peaks = [0.0] * N_BANDS
+        self.started = time.monotonic()
+        self.last_audio = self.started
+        self.transcribing = False
+        self.area = None
+
+    def do_activate(self):
+        if not LayerShell.is_supported():
+            print("whisper-dictate-overlay: layer-shell not supported, no overlay",
+                  file=sys.stderr)
+            self.quit()
+            return
+
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gtk.Widget.get_display(Gtk.Window()), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        win = Gtk.Window(application=self)
+        win.set_decorated(False)
+        win.set_default_size(WIDTH, HEIGHT)
+
+        LayerShell.init_for_window(win)
+        LayerShell.set_namespace(win, "whisper-dictate")
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        LayerShell.set_anchor(win, LayerShell.Edge.BOTTOM, True)
+        LayerShell.set_margin(win, LayerShell.Edge.BOTTOM, 64)
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.NONE)
+        LayerShell.set_exclusive_zone(win, -1)
+
+        self.area = Gtk.DrawingArea()
+        self.area.set_content_width(WIDTH)
+        self.area.set_content_height(HEIGHT)
+        self.area.add_css_class("panel")
+        self.area.set_draw_func(self.draw)
+        win.set_child(self.area)
+        win.present()
+
+        GLib.timeout_add(1000 // FPS, self.tick)
+        _signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.on_usr1)
+        _signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.on_term)
+        _signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self.on_term)
+
+    def on_usr1(self):
+        self.transcribing = True
+        return GLib.SOURCE_CONTINUE
+
+    def on_term(self):
+        self.quit()
+        return GLib.SOURCE_REMOVE
+
+    def tick(self):
+        now = time.monotonic()
+        if not self.transcribing and self.tail.read():
+            self.last_audio = now
+            target = spectrum(self.tail.samples)
+        else:
+            target = [0.0] * N_BANDS
+        for i, t in enumerate(target):
+            # Fast attack, slower release for smooth motion.
+            cur = self.levels[i]
+            self.levels[i] = t if t > cur else cur * 0.82 + t * 0.18
+            self.peaks[i] = max(self.levels[i], self.peaks[i] - 0.015)
+        self.area.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def draw(self, _area, cr, width, height):
+        now = time.monotonic()
+        pad = 14
+
+        # Status dot: pulsing red while recording, amber while transcribing,
+        # grey if no audio has arrived for a while (recorder not delivering).
+        stalled = not self.transcribing and now - self.last_audio > 1.0
+        if self.transcribing:
+            r, g, b = 0.98, 0.70, 0.20
+            alpha = 0.55 + 0.45 * abs(math.sin(now * 4))
+        elif stalled:
+            r, g, b, alpha = 0.55, 0.55, 0.58, 1.0
+        else:
+            r, g, b = 0.94, 0.27, 0.27
+            alpha = 0.6 + 0.4 * (0.5 + 0.5 * math.sin(now * 5))
+        cr.set_source_rgba(r, g, b, alpha)
+        cr.arc(pad + 6, height / 2, 6, 0, 2 * math.pi)
+        cr.fill()
+
+        # Label: elapsed time or state.
+        cr.set_source_rgba(0.93, 0.93, 0.95, 0.95)
+        cr.select_font_face("Sans", 0, 1)
+        cr.set_font_size(13)
+        if self.transcribing:
+            label = "Transcribing…"
+        else:
+            secs = int(now - self.started)
+            label = f"{secs // 60}:{secs % 60:02d}"
+        ext = cr.text_extents(label)
+        text_x = pad + 20
+        cr.move_to(text_x, height / 2 - ext.y_bearing - ext.height / 2)
+        cr.show_text(label)
+
+        if self.transcribing:
+            return
+
+        # Spectrum bars.
+        x0 = text_x + 48
+        x1 = width - pad
+        bar_area = x1 - x0
+        gap = 2
+        bar_w = (bar_area - gap * (N_BANDS - 1)) / N_BANDS
+        max_h = height - 2 * pad
+        mid = height / 2
+        for i, level in enumerate(self.levels):
+            x = x0 + i * (bar_w + gap)
+            h = max(2.0, level * max_h)
+            # Colour shifts from teal (low) to violet (high frequencies).
+            t = i / (N_BANDS - 1)
+            cr.set_source_rgba(0.25 + 0.45 * t, 0.80 - 0.35 * t, 0.85, 0.95)
+            _rounded_rect(cr, x, mid - h / 2, bar_w, h, min(bar_w / 2, 2))
+            cr.fill()
+            # Peak markers above and below.
+            ph = max(2.0, self.peaks[i] * max_h)
+            if ph > h + 2:
+                cr.set_source_rgba(1, 1, 1, 0.35)
+                cr.rectangle(x, mid - ph / 2, bar_w, 1.5)
+                cr.rectangle(x, mid + ph / 2 - 1.5, bar_w, 1.5)
+                cr.fill()
+
+
+def _rounded_rect(cr, x, y, w, h, r):
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: whisper-dictate-overlay RECORDING.wav", file=sys.stderr)
+        return 2
+    return Overlay(sys.argv[1]).run([])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
