@@ -1,39 +1,152 @@
 #!/usr/bin/env bash
+#
+# Toggle dictation: first call starts recording the microphone, second call
+# stops recording, transcribes the whole recording with whisper.cpp and types
+# the result into the focused window.
+#
+# Transcribing the full recording in one go (instead of streaming) means no
+# words are dropped between chunks, nothing is typed twice, and Whisper gets
+# the full sentence context, which noticeably improves accuracy.
+#
+# To keep latency low, whisper-server is started together with the recorder so
+# the model is loaded onto the GPU while you are still speaking. When you stop,
+# only the actual transcription remains.
 
-# Configuration
-MODEL="/usr/share/whisper.cpp-model-large-v3-turbo/ggml-large-v3-turbo.bin"
-PID_FILE="/tmp/whisper_dictate.pid"
+# Configuration (override via environment variables)
+MODEL="${WHISPER_DICTATE_MODEL:-/usr/share/whisper.cpp-model-large-v3-turbo/ggml-large-v3-turbo.bin}"
+LANGUAGE="${WHISPER_DICTATE_LANG:-en}"      # e.g. "nl", or "auto" to detect
+THREADS="${WHISPER_DICTATE_THREADS:-8}"
+PORT="${WHISPER_DICTATE_PORT:-8178}"        # local whisper-server port
+KEY_DELAY="${WHISPER_DICTATE_KEY_DELAY:-4}" # ms between / holding keys (ydotool default: 20)
+# Optional Silero VAD model: skips silence before transcribing, which avoids
+# Whisper hallucinating text during pauses. Used only if the file exists.
+VAD_MODEL="${WHISPER_DICTATE_VAD_MODEL:-${XDG_DATA_HOME:-$HOME/.local/share}/whisper-dictate/ggml-silero-v5.1.2.bin}"
 
-if [ -f "$PID_FILE" ]; then
-    # Toggle OFF: Kill the process group (the stream + while loop)
-    PID=$(cat "$PID_FILE")
-    kill -- -$(ps -o pgid= -p "$PID" | tr -d ' ')
-    rm "$PID_FILE"
-    notify-send "Dictation" "Microphone OFF" -i mic-off -t 2000
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/whisper-dictate"
+STATE_FILE="$STATE_DIR/recording"           # recorder PID, wav path, server PID
+SERVER_URL="http://127.0.0.1:$PORT"
+
+mkdir -p "$STATE_DIR"
+
+notify() {
+    # The synchronous hint makes a new notification replace the previous one.
+    notify-send "Dictation" "$1" -i "$2" -t "${3:-2000}" \
+        -h string:x-canonical-private-synchronous:whisper-dictate
+}
+
+is_recording() {
+    [[ -f "$STATE_FILE" ]] || return 1
+    local pid
+    pid=$(head -n1 "$STATE_FILE")
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Wait up to $2 iterations of 0.05s for process $1 to exit.
+wait_exit() {
+    for (( i = 0; i < $2; i++ )); do
+        kill -0 "$1" 2>/dev/null || return 0
+        sleep 0.05
+    done
+    return 1
+}
+
+cleanup_stale() {
+    # Clear leftovers from a crashed/killed previous run.
+    if [[ -f "$STATE_FILE" ]]; then
+        local _ wav server_pid
+        { read -r _; read -r wav; read -r server_pid; } < "$STATE_FILE"
+        [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
+        [[ -n "$wav" ]] && rm -f "$wav"
+        rm -f "$STATE_FILE"
+    fi
+}
+
+start_recording() {
+    local wav rec_pid server_pid
+    wav=$(mktemp "$STATE_DIR/rec-XXXXXX.wav")
+
+    # setsid detaches both processes so they survive this script exiting and
+    # are not affected by signals sent to the hotkey daemon's process group.
+    setsid pw-record --rate 16000 --channels 1 --format s16 "$wav" \
+        </dev/null >/dev/null 2>&1 &
+    rec_pid=$!
+
+    local vad_args=()
+    [[ -f "$VAD_MODEL" ]] && vad_args=(--vad -vm "$VAD_MODEL")
+
+    setsid whisper-server -m "$MODEL" -l "$LANGUAGE" -t "$THREADS" -nt -sns \
+        "${vad_args[@]}" --host 127.0.0.1 --port "$PORT" \
+        </dev/null >"$STATE_DIR/server.log" 2>&1 &
+    server_pid=$!
+
+    printf '%s\n%s\n%s\n' "$rec_pid" "$wav" "$server_pid" > "$STATE_FILE"
+    notify "Microphone ON" mic-on
+}
+
+stop_and_transcribe() {
+    local rec_pid wav server_pid text status
+    { read -r rec_pid; read -r wav; read -r server_pid; } < "$STATE_FILE"
+    rm -f "$STATE_FILE"
+
+    # SIGTERM lets pw-record finalize the WAV header (SIGINT may be ignored in
+    # background processes); wait for it to exit.
+    kill -TERM "$rec_pid" 2>/dev/null
+    wait_exit "$rec_pid" 40
+
+    if [[ ! -s "$wav" ]]; then
+        notify "No audio recorded" dialog-error
+        kill "$server_pid" 2>/dev/null
+        rm -f "$wav"
+        return 1
+    fi
+
+    notify "Transcribing…" mic-off 10000
+
+    # Wait for the server to finish loading the model (usually already done).
+    for _ in {1..600}; do
+        curl -sf -o /dev/null "$SERVER_URL/" && break
+        kill -0 "$server_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+
+    # Strip non-speech annotations like [BLANK_AUDIO], (music), *laughs*,
+    # then join lines and squeeze whitespace.
+    text=$(set -o pipefail
+        curl -sSf "$SERVER_URL/inference" \
+            -F "file=@$wav" -F response_format=text 2>>"$STATE_DIR/server.log" \
+        | sed -E 's/\[[^]]*\]//g; s/\([^)]*\)//g; s/\*[^*]*\*//g' \
+        | tr '\n' ' ' \
+        | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
+    status=$?
+
+    kill "$server_pid" 2>/dev/null
+    rm -f "$wav"
+
+    if (( status != 0 )); then
+        notify "Transcription failed, see $STATE_DIR/server.log" dialog-error 5000
+        return 1
+    fi
+    # Whisper tends to "hear" these stock phrases in silence or noise. Drop
+    # the result if that is all it produced.
+    case "$(tr -d '[:punct:]' <<< "${text,,}")" in
+        you|"thank you"|thanks|"thanks for watching"|"thank you for watching"|bye)
+            text="" ;;
+    esac
+
+    if [[ -z "$text" ]]; then
+        notify "Nothing recognized" mic-off
+        return 0
+    fi
+
+    # Read from stdin so text starting with '-' isn't parsed as an option and
+    # backslashes aren't interpreted as escapes.
+    printf '%s ' "$text" | ydotool type -d "$KEY_DELAY" -H "$KEY_DELAY" -f -
+    notify "Done" mic-off 1000
+}
+
+if is_recording; then
+    stop_and_transcribe
 else
-    # Toggle ON: Start whisper-stream
-    # --flash-attn: Speeds up GPU inference
-    # -t 8: Uses 8 CPU threads alongside the GPU
-    # --step 0: Processes audio as fast as possible
-    whisper-stream \
-        -m "$MODEL" \
-        -t 8 --step 0 --length 5000 \
-        --flash-attn \
-        2>/dev/null | while read -r line; do
-            # Skip metadata lines (### markers, timing info, empty)
-            [[ -z "$line" ]] && continue
-            [[ "$line" == *"### Transcription"* ]] && continue
-            [[ "$line" == *"| t0 ="* ]] && continue
-            [[ "$line" == *"[Start speaking]"* ]] && continue
-            # Extract text after timestamp bracket, or use line as-is
-            if [[ "$line" =~ \[.*--\>.*\](.*) ]]; then
-                line="${BASH_REMATCH[1]}"
-            fi
-            CLEAN_LINE=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            [[ -n "$CLEAN_LINE" ]] && ydotool type "$CLEAN_LINE "
-        done &
-
-    echo $! > "$PID_FILE"
-    notify-send "Dictation" "Microphone ON" -i mic-on -t 2000
+    cleanup_stale
+    start_recording
 fi
-

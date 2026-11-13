@@ -17,22 +17,23 @@ paru -S whisper-dictate-git
 - **Arch Linux** (or derivative)
 - [ydotool](https://github.com/ReimuNotMoe/ydotool) for simulating keyboard input
 - [libnotify](https://gitlab.gnome.org/GNOME/libnotify) for desktop notifications (`notify-send`)
+- [PipeWire](https://pipewire.org/) for recording the microphone (`pw-record`)
 
 ### Install whisper.cpp
 
-Pick **one** of the following `whisper.cpp` packages depending on your hardware:
+Install the official `whisper-cpp` package plus **one** `ggml` backend matching your hardware:
 
-| Package | GPU | When to use |
-|---------|-----|-------------|
-| `whisper.cpp-vulkan` | AMD/NVIDIA/Intel (Vulkan) | Recommended for most GPU-accelerated setups |
-| `whisper.cpp-hip` | AMD (ROCm) | If you already have a ROCm stack configured |
-| `whisper.cpp` | None (CPU only) | No compatible GPU, or just want simplicity |
-
-These packages conflict with each other — only one can be installed at a time.
+| Backend package | GPU | When to use |
+|-----------------|-----|-------------|
+| `ggml-vulkan` | AMD/NVIDIA/Intel (Vulkan) | Recommended for most GPU-accelerated setups |
+| `ggml-cuda` | NVIDIA (CUDA) | If you already have a CUDA stack configured |
+| `ggml-hip` | AMD (ROCm) | If you already have a ROCm stack configured |
+| *(none)* | None (CPU only) | No compatible GPU, or just want simplicity |
 
 ```bash
 # Example: Vulkan (most common)
-paru -S whisper.cpp-vulkan whisper.cpp-model-large-v3-turbo ydotool libnotify
+sudo pacman -S whisper-cpp ggml-vulkan ydotool libnotify pipewire-audio
+paru -S whisper.cpp-model-large-v3-turbo
 ```
 
 ### Set up ydotool
@@ -57,8 +58,6 @@ Reboot for the group and udev changes to take effect, then enable the daemon:
 systemctl --user enable --now ydotool
 ```
 
-> **Note:** If using the CPU-only build, remove `--flash-attn` from the script as it requires GPU support.
-
 ## Usage
 
 Run the script to toggle dictation on/off:
@@ -67,8 +66,8 @@ Run the script to toggle dictation on/off:
 whisper-dictate-toggle
 ```
 
-- **First run** starts `whisper-stream` and begins typing transcribed speech at your cursor position.
-- **Second run** kills the process and stops dictation.
+- **First run** starts recording your microphone.
+- **Second run** stops recording, transcribes everything you said, and types it at your cursor position.
 
 Desktop notifications will confirm the current state.
 
@@ -91,26 +90,37 @@ bind = , F9, exec, whisper-dictate-toggle
 
 ## Configuration
 
-You can tune these parameters in the script:
+Set these environment variables to override the defaults:
 
-| Parameter      | Default          | Description                                     |
-| -------------- | ---------------- | ----------------------------------------------- |
-| `-t`           | `8`              | CPU threads used alongside the GPU              |
-| `--step`       | `0`              | Audio step size in ms (0 = as fast as possible) |
-| `--length`     | `5000`           | Audio chunk length in ms                        |
-| `--flash-attn` | enabled          | Flash attention for faster GPU inference        |
-| `-m`           | `large-v3-turbo` | Whisper model path                              |
+| Variable                    | Default          | Description                                             |
+| --------------------------- | ---------------- | ------------------------------------------------------- |
+| `WHISPER_DICTATE_MODEL`     | `large-v3-turbo` | Whisper model path                                      |
+| `WHISPER_DICTATE_LANG`      | `en`             | Spoken language (e.g. `nl`), or `auto` to detect it     |
+| `WHISPER_DICTATE_THREADS`   | `8`              | CPU threads used alongside the GPU                      |
+| `WHISPER_DICTATE_KEY_DELAY` | `4`              | ydotool key delay/hold in ms; raise if characters drop  |
+| `WHISPER_DICTATE_PORT`      | `8178`           | Local port for the temporary `whisper-server`           |
+| `WHISPER_DICTATE_VAD_MODEL` | `~/.local/share/whisper-dictate/ggml-silero-v5.1.2.bin` | Optional Silero VAD model (see below) |
+
+### Voice activity detection (optional, recommended)
+
+With a Silero VAD model in place, silence is skipped before transcription, which stops Whisper from hallucinating text during pauses:
+
+```bash
+mkdir -p ~/.local/share/whisper-dictate
+curl -L -o ~/.local/share/whisper-dictate/ggml-silero-v5.1.2.bin \
+  https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+```
 
 ## How it works
 
-1. `whisper-stream` captures microphone audio and streams transcriptions to stdout
-2. A `while read` loop filters out metadata (timestamps, markers) and extracts the speech text
-3. `ydotool type` simulates keyboard input to type the transcription at your cursor
-4. The process group PID is saved to `/tmp/whisper_dictate.pid` so a second invocation can cleanly kill everything
+1. `pw-record` captures microphone audio (16 kHz mono) to a temporary WAV file, while `whisper-server` loads the model onto the GPU in the background
+2. On the second toggle, the recorder is stopped and the whole recording is sent to the local server for transcription in one pass, after which the server exits
+3. Non-speech annotations such as `[BLANK_AUDIO]` or `(music)` are stripped
+4. `ydotool type` simulates keyboard input to type the transcription at your cursor
 
 ## Issues
 
-Issues related to third-party dependencies (whisper-stream, ydotool, etc.) should be reported at their respective upstream repositories, not here. This project is only the toggling/typing wrapper around them.
+Issues related to third-party dependencies (whisper.cpp, ydotool, etc.) should be reported at their respective upstream repositories, not here. This project is only the toggling/typing wrapper around them.
 
 ## Contributing
 
