@@ -1,12 +1,12 @@
 # Maintainer: Dino Hensen <dino.hensen@gmail.com>
 pkgname=whisper-dictate-git
-pkgver=r10.67c37c0
+pkgver=r14.9b83332
 pkgrel=1
 pkgdesc='Toggle local speech-to-text dictation using whisper.cpp'
 arch=('any')
 url='https://github.com/dhensen/whisper-dictate'
 license=('MIT')
-depends=('whisper-cpp' 'ydotool' 'libnotify' 'pipewire-audio' 'curl')
+depends=('whisper-cpp' 'ydotool' 'libnotify' 'pipewire-audio' 'curl' 'systemd')
 makedepends=('git')
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')

@@ -118,6 +118,8 @@ curl -L -o ~/.local/share/whisper-dictate/ggml-silero-v5.1.2.bin \
 3. Non-speech annotations such as `[BLANK_AUDIO]` or `(music)` are stripped
 4. `ydotool type` simulates keyboard input to type the transcription at your cursor
 
+The recorder and server run as transient systemd user units (`whisper-dictate-rec`, `whisper-dictate-server`) so they survive the hotkey launcher. Logs from the server are in `$XDG_RUNTIME_DIR/whisper-dictate/server.log`.
+
 ## Issues
 
 Issues related to third-party dependencies (whisper.cpp, ydotool, etc.) should be reported at their respective upstream repositories, not here. This project is only the toggling/typing wrapper around them.

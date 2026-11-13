@@ -23,103 +23,95 @@ KEY_DELAY="${WHISPER_DICTATE_KEY_DELAY:-4}" # ms between / holding keys (ydotool
 VAD_MODEL="${WHISPER_DICTATE_VAD_MODEL:-${XDG_DATA_HOME:-$HOME/.local/share}/whisper-dictate/ggml-silero-v5.1.2.bin}"
 
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/whisper-dictate"
-STATE_FILE="$STATE_DIR/recording"           # recorder PID, wav path, server PID
+WAV_FILE="$STATE_DIR/recording"             # path of the WAV being recorded
+NOTIFY_ID_FILE="$STATE_DIR/notify-id"       # notification to replace
 SERVER_URL="http://127.0.0.1:$PORT"
+
+# The recorder and server run as their own transient systemd user units.
+# Desktop environments like KDE launch hotkey commands inside a systemd
+# service and kill everything in it when that service is stopped, so plain
+# background processes (even with setsid) don't reliably survive.
+REC_UNIT="whisper-dictate-rec"
+SERVER_UNIT="whisper-dictate-server"
 
 mkdir -p "$STATE_DIR"
 
 notify() {
-    # The synchronous hint makes a new notification replace the previous one.
-    notify-send "Dictation" "$1" -i "$2" -t "${3:-2000}" \
-        -h string:x-canonical-private-synchronous:whisper-dictate
+    # Replace the previous notification instead of stacking new popups.
+    local id args=(-p -e -a "Dictation" -i "$2" -t "${3:-2000}")
+    id=$(cat "$NOTIFY_ID_FILE" 2>/dev/null)
+    [[ "$id" =~ ^[0-9]+$ ]] && args+=(-r "$id")
+    notify-send "${args[@]}" "Dictation" "$1" > "$NOTIFY_ID_FILE"
 }
 
-is_recording() {
-    [[ -f "$STATE_FILE" ]] || return 1
-    local pid
-    pid=$(head -n1 "$STATE_FILE")
-    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+unit_active() {
+    systemctl --user is-active --quiet "$1"
 }
 
-# Wait up to $2 iterations of 0.05s for process $1 to exit.
-wait_exit() {
-    for (( i = 0; i < $2; i++ )); do
-        kill -0 "$1" 2>/dev/null || return 0
-        sleep 0.05
-    done
-    return 1
-}
-
-cleanup_stale() {
-    # Clear leftovers from a crashed/killed previous run.
-    if [[ -f "$STATE_FILE" ]]; then
-        local _ wav server_pid
-        { read -r _; read -r wav; read -r server_pid; } < "$STATE_FILE"
-        [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null
-        [[ -n "$wav" ]] && rm -f "$wav"
-        rm -f "$STATE_FILE"
-    fi
+stop_units() {
+    systemctl --user stop "$@" 2>/dev/null
+    systemctl --user reset-failed "$@" 2>/dev/null
 }
 
 start_recording() {
-    local wav rec_pid server_pid
-    wav=$(mktemp "$STATE_DIR/rec-XXXXXX.wav")
+    local wav
+    # Clear leftovers from a crashed/killed previous run.
+    stop_units "$REC_UNIT" "$SERVER_UNIT"
+    [[ -f "$WAV_FILE" ]] && rm -f "$(cat "$WAV_FILE")"
 
-    # setsid detaches both processes so they survive this script exiting and
-    # are not affected by signals sent to the hotkey daemon's process group.
-    setsid pw-record --rate 16000 --channels 1 --format s16 "$wav" \
-        </dev/null >/dev/null 2>&1 &
-    rec_pid=$!
+    wav=$(mktemp "$STATE_DIR/rec-XXXXXX.wav")
+    echo "$wav" > "$WAV_FILE"
+
+    systemd-run --user --quiet --collect --unit="$REC_UNIT" \
+        pw-record --rate 16000 --channels 1 --format s16 "$wav"
 
     local vad_args=()
     [[ -f "$VAD_MODEL" ]] && vad_args=(--vad -vm "$VAD_MODEL")
 
-    setsid whisper-server -m "$MODEL" -l "$LANGUAGE" -t "$THREADS" -nt -sns \
-        "${vad_args[@]}" --host 127.0.0.1 --port "$PORT" \
-        </dev/null >"$STATE_DIR/server.log" 2>&1 &
-    server_pid=$!
+    systemd-run --user --quiet --collect --unit="$SERVER_UNIT" \
+        -p StandardOutput="truncate:$STATE_DIR/server.log" \
+        whisper-server -m "$MODEL" -l "$LANGUAGE" -t "$THREADS" -nt -sns \
+        "${vad_args[@]}" --host 127.0.0.1 --port "$PORT"
 
-    printf '%s\n%s\n%s\n' "$rec_pid" "$wav" "$server_pid" > "$STATE_FILE"
-    notify "Microphone ON" mic-on
+    notify "Microphone ON" mic-on 3000
 }
 
 stop_and_transcribe() {
-    local rec_pid wav server_pid text status
-    { read -r rec_pid; read -r wav; read -r server_pid; } < "$STATE_FILE"
-    rm -f "$STATE_FILE"
+    local wav text status
+    wav=$(cat "$WAV_FILE" 2>/dev/null)
+    rm -f "$WAV_FILE"
 
-    # SIGTERM lets pw-record finalize the WAV header (SIGINT may be ignored in
-    # background processes); wait for it to exit.
-    kill -TERM "$rec_pid" 2>/dev/null
-    wait_exit "$rec_pid" 40
+    # Stopping the unit sends SIGTERM, which makes pw-record finalize the WAV
+    # header; systemctl waits until it has exited.
+    stop_units "$REC_UNIT"
 
-    if [[ ! -s "$wav" ]]; then
+    if [[ -z "$wav" || ! -s "$wav" ]]; then
         notify "No audio recorded" dialog-error
-        kill "$server_pid" 2>/dev/null
-        rm -f "$wav"
+        stop_units "$SERVER_UNIT"
+        [[ -n "$wav" ]] && rm -f "$wav"
         return 1
     fi
 
-    notify "Transcribing…" mic-off 10000
+    notify "Transcribing…" mic-off 30000
 
     # Wait for the server to finish loading the model (usually already done).
     for _ in {1..600}; do
         curl -sf -o /dev/null "$SERVER_URL/" && break
-        kill -0 "$server_pid" 2>/dev/null || break
+        unit_active "$SERVER_UNIT" || break
         sleep 0.05
     done
 
     # Strip non-speech annotations like [BLANK_AUDIO], (music), *laughs*,
     # then join lines and squeeze whitespace.
     text=$(set -o pipefail
-        curl -sSf "$SERVER_URL/inference" \
+        curl -sSf --max-time 120 "$SERVER_URL/inference" \
             -F "file=@$wav" -F response_format=text 2>>"$STATE_DIR/server.log" \
         | sed -E 's/\[[^]]*\]//g; s/\([^)]*\)//g; s/\*[^*]*\*//g' \
         | tr '\n' ' ' \
         | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
     status=$?
 
-    kill "$server_pid" 2>/dev/null
+    stop_units "$SERVER_UNIT"
     rm -f "$wav"
 
     if (( status != 0 )); then
@@ -144,9 +136,16 @@ stop_and_transcribe() {
     notify "Done" mic-off 1000
 }
 
-if is_recording; then
+# Only one instance at a time: presses while transcribing are ignored rather
+# than starting a new recording halfway through.
+exec 9>"$STATE_DIR/lock"
+if ! flock -n 9; then
+    notify "Still transcribing…" mic-off
+    exit 0
+fi
+
+if unit_active "$REC_UNIT"; then
     stop_and_transcribe
 else
-    cleanup_stale
     start_recording
 fi
