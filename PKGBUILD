@@ -1,6 +1,6 @@
 # Maintainer: Dino Hensen <dino.hensen@gmail.com>
 pkgname=whisper-dictate-git
-pkgver=r15.93beb50
+pkgver=r16.1b49c08
 pkgrel=1
 pkgdesc='Toggle local speech-to-text dictation using whisper.cpp'
 arch=('any')
